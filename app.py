@@ -9,6 +9,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import time
 from dotenv import load_dotenv
+import joblib
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.preprocessing import LabelEncoder
 
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -399,28 +402,30 @@ if "dark_mode" not in st.session_state:
 # -----------------------
 # This is a simple local user store for demo purposes. In production, replace
 # with a proper authentication system and hashed password storage.
+# -----------------------
+# User Database (Local CSV)
+# -----------------------
 USER_DB_PATH = Path(__file__).parent / "users.csv"
-
 
 def _hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-
 def load_users() -> pd.DataFrame:
     if USER_DB_PATH.exists():
         return pd.read_csv(USER_DB_PATH)
+    # Ensure the columns match what we actually use
     return pd.DataFrame(columns=["username", "email", "password_hash"])
 
-
-def save_user(name, email, password, language):
-
-    import csv
-
-    with open("users.csv", "a", newline="") as file:
-        writer = csv.writer(file)
-
-        writer.writerow([name, email, password, language])
-
+def save_user(username, email, password_hash):
+    """Appends a single new user to the CSV file safely."""
+    new_data = pd.DataFrame([[username, email, password_hash]], 
+                            columns=["username", "email", "password_hash"])
+    
+    # If file exists, append without header; if not, create with header
+    if not USER_DB_PATH.exists():
+        new_data.to_csv(USER_DB_PATH, index=False)
+    else:
+        new_data.to_csv(USER_DB_PATH, mode='a', header=False, index=False)
 
 def verify_user(email: str, password: str) -> dict | None:
     users = load_users()
@@ -428,29 +433,27 @@ def verify_user(email: str, password: str) -> dict | None:
         return None
     password_hash = _hash_password(password)
     match = users[
-        (users["email"].str.lower() == email.lower()) &
+        (users["email"].str.lower() == email.lower()) & 
         (users["password_hash"] == password_hash)
     ]
     if not match.empty:
         return match.iloc[0].to_dict()
     return None
 
-
 def create_user(username: str, email: str, password: str) -> tuple[bool, str]:
     users = load_users()
+    # Case-insensitive check for existing users
     if not users[users["email"].str.lower() == email.lower()].empty:
         return False, "Email already registered."
     if not users[users["username"].str.lower() == username.lower()].empty:
         return False, "Username already taken."
-    new_user = {
-        "username": username,
-        "email": email,
-        "password_hash": _hash_password(password)
-    }
-    users = pd.concat([users, pd.DataFrame([new_user])], ignore_index=True)
-    save_users(users)
+    
+    pwd_hash = _hash_password(password)
+    
+    # Save using our updated helper function
+    save_user(username, email, pwd_hash)
+    
     return True, "Account created successfully."
-
 
 # -----------------------
 # Login Page
@@ -908,33 +911,103 @@ if nav_option == "Send Salary Emails":
 
 # ML Predictions Page
 
-elif nav_option == "ML Predictions":
 
+
+# Helper function to handle categorical data and retrain
+def train_and_save(model_name, csv_file, target_col):
+    df = pd.read_csv(csv_file)
+    
+    # Remove ID columns that confuse the model
+    cols_to_drop = [c for c in df.columns if 'id' in c.lower() or 'name' in c.lower()]
+    df = df.drop(columns=cols_to_drop)
+    
+    # Preprocessing: Convert text (Skills, etc.) to numbers
+    for col in df.columns:
+        if df[col].dtype == 'object' and col != target_col:
+            df[col] = pd.factorize(df[col])[0]
+            
+    X = df.drop(columns=[target_col])
+    y = df[target_col]
+    
+    # Retrain
+    if "history" in model_name:
+        model = RandomForestRegressor(n_estimators=100)
+    else:
+        model = RandomForestClassifier(n_estimators=100)
+        
+    model.fit(X, y)
+    joblib.dump(model, model_name)
+    return True
+
+if nav_option == "ML Predictions":
     st.markdown('<div class="main-modern-section">', unsafe_allow_html=True)
-    st.markdown('<div class="main-modern-header">🤖 ML Predictions</div>', unsafe_allow_html=True)
-    st.subheader("Task Priority")
-    skills = st.text_input("Required Skills")
-    deadline = st.number_input("Deadline Days", min_value=1)
-    if st.button("Predict Priority"):
-        st.success("Predicted Priority: High")
-    st.subheader("Employee Role")
-    emp_skills = st.text_input("Employee Skills")
-    exp = st.number_input("Experience", min_value=0)
-    workload = st.number_input("Workload %", 0, 100)
-    if st.button("Predict Role"):
-        st.success("Suggested Role: Developer")
-    st.subheader("Project Success")
-    team = st.number_input("Team Size", min_value=1)
-    days = st.number_input("Completion Days", min_value=1)
-    if st.button("Predict Success"):
-        st.success("Success Score: 82%")
+    st.markdown('<div class="main-modern-header">🧠 AI Model Management</div>', unsafe_allow_html=True)
+    
+    # --- TRAINING AREA ---
+    st.markdown("### 📥 Retrain Models")
+    st.caption("Upload your new CSV files to update the AI logic.")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.write("**Priority Model**")
+        p_csv = st.file_uploader("Upload Task Data", type="csv", key="up1")
+        if p_csv and st.button("Update Priority", key="btn1"):
+            # Note: Assuming 'priority' is the target column name
+            train_and_save("priority_model.pkl", p_csv, "priority")
+            st.success("Priority Model Updated!")
+
+    with col2:
+        st.write("**Employee Model**")
+        e_csv = st.file_uploader("Upload Employee Data", type="csv", key="up2")
+        if e_csv and st.button("Update Role Logic", key="btn2"):
+            train_and_save("employee_model.pkl", e_csv, "role")
+            st.success("Employee Model Updated!")
+
+    with col3:
+        st.write("**History Model**")
+        h_csv = st.file_uploader("Upload History Data", type="csv", key="up3")
+        if h_csv and st.button("Update Success Logic", key="btn3"):
+            train_and_save("history_model.pkl", h_csv, "success_score")
+            st.success("History Model Updated!")
+
+    st.markdown("<hr style='border:1px solid rgba(255,255,255,0.1); margin: 30px 0;'>", unsafe_allow_html=True)
+
+    # --- PREDICTION AREA ---
+    st.markdown("### 🔮 Prediction Tools")
+    
+    # Create clean white tabs for predictions
+    tab1, tab2, tab3 = st.tabs(["🎯 Task Priority", "👤 Role Matching", "📊 Project Success"])
+    
+    with tab1:
+        st.markdown('<div style="background:rgba(255,255,255,0.05); padding:20px; border-radius:15px;">', unsafe_allow_html=True)
+        # Using columns for inputs makes it look like a professional dashboard
+        c1, c2 = st.columns(2)
+        with c1:
+            skills_req = st.text_input("Required Skills", placeholder="e.g. Python, SQL")
+        with c2:
+            days_left = st.number_input("Days until Deadline", min_value=1, value=7)
+        
+        if st.button("Predict Priority"):
+            # Load the model you just trained
+            model = joblib.load("priority_model.pkl")
+            # Logic for prediction would go here
+            st.success(f"Recommended Priority: **High**")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with tab2:
+        st.markdown('<div style="background:rgba(255,255,255,0.05); padding:20px; border-radius:15px;">', unsafe_allow_html=True)
+        exp_y = st.slider("Experience Years", 0, 20, 5)
+        work_l = st.progress(0.4) # Visualizing current workload
+        if st.button("Find Ideal Role"):
+            st.info("Best fit: **Backend Developer**")
+        st.markdown('</div>', unsafe_allow_html=True)
+
     st.markdown('</div>', unsafe_allow_html=True)
 # -----------------------
 # Meeting Scheduler Page
 # -----------------------
-
 elif nav_option == "Meeting Scheduler":
-
     st.markdown('<div class="main-modern-section">', unsafe_allow_html=True)
     st.markdown('<div class="main-modern-header">📅 Automatic Meeting Scheduler</div>', unsafe_allow_html=True)
 
